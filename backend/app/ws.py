@@ -1,0 +1,92 @@
+"""WebSocket connection manager: real-time sync hub.
+
+All TVs connect to the same shared  /ws/display  endpoint (no per-TV token).
+
+Broadcast payloads (JSON):
+  {"type": "update", "reason": "<what changed>"}                -> clients refetch data
+  {"type": "slide", "index": <n>, "server_time": <epoch ms>}    -> TVs jump to same slide (synchronized mode)
+  {"type": "displays_state", "connected": <n>}                  -> admin panel live connection count
+  {"type": "pong"}
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import List
+
+from fastapi import WebSocket
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.displays: List[WebSocket] = []      # all TV screens (shared, no token)
+        self.admins: List[WebSocket] = []
+
+    # ---- displays (public, shared) ----
+    async def connect_display(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self.displays.append(ws)
+        await self.push_displays_state()
+
+    def disconnect_display(self, ws: WebSocket) -> None:
+        if ws in self.displays:
+            self.displays.remove(ws)
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                return
+            if loop.is_running():
+                loop.create_task(self.push_displays_state())
+
+    # ---- admin ----
+    async def connect_admin(self, ws: WebSocket) -> None:
+        # accept() is already done by the endpoint (needed to read the auth message)
+        self.admins.append(ws)
+
+    def disconnect_admin(self, ws: WebSocket) -> None:
+        if ws in self.admins:
+            self.admins.remove(ws)
+
+    # ---- broadcasts ----
+    async def broadcast_update(self, reason: str) -> None:
+        msg = {"type": "update", "reason": reason}
+        await _broadcast([*self.displays, *self.admins], msg)
+
+    async def broadcast_slide(self, index: int, server_time: int) -> None:
+        await _broadcast(list(self.displays), {
+            "type": "slide",
+            "index": index,
+            "server_time": server_time,
+        })
+
+    async def push_displays_state(self) -> None:
+        await _broadcast(list(self.admins), {
+            "type": "displays_state",
+            "connected": len(self.displays),
+        })
+
+
+async def _broadcast(targets: List[WebSocket], msg: dict) -> None:
+    dead: List[WebSocket] = []
+    for ws in targets:
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in manager.displays:
+            manager.disconnect_display(ws)
+        else:
+            manager.disconnect_admin(ws)
+
+
+manager = ConnectionManager()
+
+
+def notify_changed(reason: str) -> None:
+    """Fire-and-forget broadcast from sync route handlers."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return
+    if loop.is_running():
+        loop.create_task(manager.broadcast_update(reason))

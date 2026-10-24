@@ -1,0 +1,583 @@
+"""FastAPI application: REST API + WebSocket sync + static media serving."""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketState
+
+from app import security
+from app.config import ALLOWED_ORIGINS, MEDIA_DIR, MAX_IMAGE_MB
+from app.database import (
+    delete_product, get_activity, get_categories, get_category,
+    get_category_by_name, get_image, get_images, get_product, get_products, get_settings,
+    get_slide_state, get_user, insert_category, insert_image, insert_product,
+    log_activity, now, rename_category, reassign_products_category,
+    save_settings, save_slide_state, update_product, update_user_password,
+)
+from app.database import delete_category as delete_category_row, delete_image as delete_image_row
+from app.ws import manager
+
+app = FastAPI(title="سامانه مدیریت محصولات و نمایش تبلیغات", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------- slideshow state
+def slide_count() -> int:
+    """Number of slides for the current settings/products (used by ticker + payload)."""
+    settings = get_settings()
+    spv = 4 if settings.get("show_mode") == "grid" else 1
+    return max(1, -(-sum(1 for p in get_products() if p["active"]) // spv))
+
+
+def normalize_slide_state() -> dict:
+    """Load slide state; clamp index if product count/settings changed."""
+    st = get_slide_state()
+    if not st.get("next_flip"):  # first boot or invalid -> start cycle from now
+        dur = max(get_settings().get("duration_seconds", 10), 3)
+        st = {"index": 0, "next_flip": now() + dur}
+        save_slide_state(st["index"], st["next_flip"])
+    total = slide_count()
+    if st["index"] >= total:
+        st["index"] %= total
+        save_slide_state(st["index"], st["next_flip"])
+    return st
+
+
+def reset_slide_cycle() -> None:
+    """On duration/show-mode change: keep index, restart the countdown + re-sync TVs."""
+    st = normalize_slide_state()
+    dur = max(get_settings().get("duration_seconds", 10), 3)
+    st = {"index": st["index"], "next_flip": now() + dur}
+    save_slide_state(st["index"], st["next_flip"])
+    asyncio.get_event_loop().create_task(
+        manager.broadcast_slide(st["index"], int(time.time() * 1000))
+    )
+
+
+async def slide_ticker() -> None:
+    """Background loop: owns the shared slideshow clock stored in SQLite.
+    When the current slide ends it advances the shared index and pushes it to every TV."""
+    try:
+        while True:
+            await asyncio.sleep(1)
+            st = normalize_slide_state()
+            if now() >= st["next_flip"]:
+                dur = max(get_settings().get("duration_seconds", 10), 3)
+                idx = (st["index"] + 1) % slide_count()
+                nf = st["next_flip"] + dur
+                if nf <= now():
+                    nf = now() + dur  # server was busy/off: resume instead of fast-forwarding
+                save_slide_state(idx, nf)
+                await manager.broadcast_slide(idx, int(time.time() * 1000))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # keep the ticker alive on unexpected errors
+        await asyncio.sleep(2)
+        asyncio.get_event_loop().create_task(slide_ticker())
+
+
+@app.on_event("startup")
+async def startup_tasks() -> None:
+    normalize_slide_state()
+    asyncio.get_event_loop().create_task(slide_ticker())
+
+# ---------------------------------------------------------------- helpers
+san_re = re.compile(r"[^a-zA-Z0-9._-]")
+
+MAGIC = {
+    b"\xff\xd8\xff": "jpg",
+    b"\x89PNG": "png",
+}
+
+
+def detect_image_ext(head: bytes, filename: str) -> Optional[str]:
+    for sig, ext in MAGIC.items():
+        if head.startswith(sig):
+            return ext
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    name = filename.lower()
+    if name.endswith((".jpg", ".jpeg")):
+        return "jpg-alt"  # header mismatch: reject below
+    return None
+
+
+async def current_admin(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    username = security.decode_token(token) if token else None
+    if not username or not get_user(username):
+        raise HTTPException(status_code=401, detail="احراز هویت نامعتبر است")
+    return username
+
+
+def discount_ok(p: dict) -> bool:
+    """Product has a currently-valid discount? (matches README section 4)"""
+    if not p.get("sale_price") or not p.get("price"):
+        return False
+    if p["sale_price"] >= p["price"]:
+        return False
+    ts = now()
+    if p.get("discount_start") and ts < p["discount_start"]:
+        return False
+    if p.get("discount_end") and ts > p["discount_end"]:
+        return False
+    return True
+
+
+def public_product(p: dict) -> dict:
+    """Shape shown on TVs: only public fields."""
+    return {
+        "id": p["id"],
+        "name": p["name"],
+        "description": p["description"],
+        "category": p["category"],
+        "price": p["price"],
+        "sale_price": p["sale_price"] if discount_ok(p) else None,
+        "discount_percent": p["discount_percent"] if discount_ok(p) else 0,
+        "sort_order": p["sort_order"],
+        "image_url": p["image_url"],
+    }
+
+
+# Pydantic models -------------------------------------------------------
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordIn(BaseModel):
+    current: str
+    next: str = Field(min_length=8, max_length=128)
+
+
+class OrderIn(BaseModel):
+    ids: list[int] = Field(min_length=1)
+
+
+@app.put("/api/admin/products/order")
+async def reorder_products(body: OrderIn, username: str = Depends(current_admin)):
+    for i, pid in enumerate(body.ids):
+        if not get_product(pid):
+            raise HTTPException(404, f"محصول {pid} یافت نشد")
+        update_product(pid, {"sort_order": i})
+    await manager.broadcast_update("reorder")
+    log_activity("reorder", f'{len(body.ids)} محصول')
+    return {"ok": True}
+
+
+class ProductIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    category: str = Field(default="", max_length=60)
+    price: int = Field(ge=0)
+    sale_price: Optional[int] = Field(default=None, ge=0)
+    discount_start: Optional[int] = None
+    discount_end: Optional[int] = None
+    sort_order: int = 0
+    active: bool = True
+    image_url: str = ""
+
+
+def validate_product(p: ProductIn) -> dict:
+    if not p.name.strip():
+        raise HTTPException(400, "نام محصول الزامی است")
+    if p.price <= 0:
+        raise HTTPException(400, "قیمت اصلی باید بزرگ‌تر از صفر باشد")
+    if p.sale_price is not None and p.sale_price > 0:
+        if p.sale_price >= p.price:
+            raise HTTPException(400, "قیمت تخفیف‌خورده باید کمتر از قیمت اصلی باشد")
+    elif p.sale_price == 0:
+        p.sale_price = None
+    if p.discount_start and p.discount_end and p.discount_start > p.discount_end:
+        raise HTTPException(400, "تاریخ شروع تخفیف نمی‌تواند بعد از پایان آن باشد")
+    percent = 0
+    if p.sale_price:
+        percent = round((p.price - p.sale_price) * 100 / p.price)
+    return {
+        "name": p.name.strip(),
+        "description": p.description.strip(),
+        "category": p.category.strip(),
+        "price": p.price,
+        "sale_price": p.sale_price,
+        "discount_percent": percent,
+        "discount_start": p.discount_start,
+        "discount_end": p.discount_end,
+        "sort_order": p.sort_order,
+        "active": 1 if p.active else 0,
+        "image_url": p.image_url,
+    }
+
+
+class SettingsIn(BaseModel):
+    shop_name: Optional[str] = None
+    logo_url: Optional[str] = None
+    background_color: Optional[str] = None
+    accent_color: Optional[str] = None
+    duration_seconds: Optional[int] = Field(default=None, ge=3, le=60)
+    show_mode: Optional[str] = None
+    sync_mode: Optional[str] = None
+
+
+# ---------------------------------------------------------------- auth
+@app.post("/api/auth/login")
+def login(body: LoginIn):
+    user = get_user(body.username)
+    if not user or not security.verify_password(body.password, user["password_hash"]):
+        raise HTTPException(401, "نام کاربری یا رمز عبور نادرست است")
+    return {"access_token": security.create_token(user["username"]), "token_type": "bearer", "username": user["username"]}
+
+
+@app.get("/api/auth/me")
+def me(username: str = Depends(current_admin)):
+    return {"username": username}
+
+
+@app.post("/api/admin/password")
+def change_password(body: PasswordIn, username: str = Depends(current_admin)):
+    user = get_user(username)
+    if not user or not security.verify_password(body.current, user["password_hash"]):
+        raise HTTPException(400, "رمز فعلی نادرست است")
+    if body.current == body.next:
+        raise HTTPException(400, "رمز جدید نباید مشابه رمز فعلی باشد")
+    update_user_password(username, security.hash_password(body.next))
+    log_activity("password_change", username)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- admin: categories
+class CategoryIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+@app.get("/api/admin/categories")
+def list_categories(username: str = Depends(current_admin)):
+    cats = get_categories()
+    counts: dict[str, int] = {}
+    for p in get_products():
+        if p["category"]:
+            counts[p["category"]] = counts.get(p["category"], 0) + 1
+    return {"items": [{**c, "product_count": counts.get(c["name"], 0)} for c in cats]}
+
+
+@app.post("/api/admin/categories")
+def add_category(body: CategoryIn, username: str = Depends(current_admin)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "نام دسته‌بندی الزامی است")
+    if get_category_by_name(name):
+        raise HTTPException(400, "چنین دسته‌بندی از قبل وجود دارد")
+    cid = insert_category(name)
+    log_activity("category_add", name)
+    return {"item": {**get_category(cid), "product_count": 0}}
+
+
+@app.put("/api/admin/categories/{cid}")
+def edit_category(cid: int, body: CategoryIn, username: str = Depends(current_admin)):
+    cat = get_category(cid)
+    if not cat:
+        raise HTTPException(404, "دسته‌بندی یافت نشد")
+    new_name = body.name.strip()
+    if not new_name:
+        raise HTTPException(400, "نام دسته‌بندی الزامی است")
+    clash = get_category_by_name(new_name)
+    if clash and clash["id"] != cid:
+        raise HTTPException(400, "چنین دسته‌بندی از قبل وجود دارد")
+    rename_category(cid, new_name)
+    if new_name != cat["name"]:
+        reassign_products_category(cat["name"], new_name)
+        log_activity("category_rename", f'{cat["name"]}→{new_name}')
+    return {"item": {**get_category(cid), "product_count": 0}}
+
+
+@app.delete("/api/admin/categories/{cid}")
+def remove_category(cid: int, username: str = Depends(current_admin)):
+    cat = get_category(cid)
+    if not cat:
+        raise HTTPException(404, "دسته‌بندی یافت نشد")
+    reassign_products_category(cat["name"], "")  # products keep existing, uncategorized
+    delete_category_row(cid)
+    log_activity("category_delete", cat["name"])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- admin: products
+@app.get("/api/admin/products")
+def admin_products(q: str = "", category: str = "", status_filter: str = "all",
+                   username: str = Depends(current_admin)):
+    items = get_products()
+    if q:
+        ql = q.lower()
+        items = [i for i in items if ql in i["name"].lower() or ql in (i["category"] or "").lower()]
+    if category:
+        items = [i for i in items if i["category"] == category]
+    if status_filter == "active":
+        items = [i for i in items if i["active"]]
+    elif status_filter == "inactive":
+        items = [i for i in items if not i["active"]]
+    elif status_filter == "discounted":
+        items = [i for i in items if discount_ok(i)]
+    return {"items": items}
+
+
+@app.post("/api/admin/products")
+async def create_product(p: ProductIn, username: str = Depends(current_admin)):
+    data = validate_product(p)
+    pid = insert_product(data)
+    log_activity("product_add", data["name"])
+    await manager.broadcast_update("create_product")
+    return {"id": pid, "item": get_product(pid)}
+
+
+@app.put("/api/admin/products/{pid}")
+async def edit_product(pid: int, p: ProductIn, username: str = Depends(current_admin)):
+    if not get_product(pid):
+        raise HTTPException(404, "محصول یافت نشد")
+    data = validate_product(p)
+    update_product(pid, data)
+    log_activity("product_edit", data["name"])
+    await manager.broadcast_update("update_product")
+    return {"id": pid, "item": get_product(pid)}
+
+
+@app.patch("/api/admin/products/{pid}/active")
+async def toggle_product(pid: int, body: dict, username: str = Depends(current_admin)):
+    if not get_product(pid):
+        raise HTTPException(404, "محصول یافت نشد")
+    update_product(pid, {"active": 1 if body.get("active") else 0})
+    log_activity("product_toggle", get_product(pid)["name"])
+    await manager.broadcast_update("toggle_active")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/products/{pid}")
+async def remove_product(pid: int, username: str = Depends(current_admin)):
+    if not get_product(pid):
+        raise HTTPException(404, "محصول یافت نشد")
+    delete_product(pid)
+    log_activity("product_delete", "")
+    await manager.broadcast_update("delete_product")
+    return {"ok": True}
+
+
+# admin: images (upload + reuse list)
+@app.post("/api/admin/images")
+async def upload_image(file: UploadFile = File(...), username: str = Depends(current_admin)):
+    max_bytes = MAX_IMAGE_MB * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(400, f"حجم فایل بیش از {MAX_IMAGE_MB} مگابایت است")
+    if len(data) < 12:
+        raise HTTPException(400, "فایل تصویر نامعتبر است")
+    ext = detect_image_ext(data[:16], file.filename or "")
+    if not ext or ext == "jpg-alt":
+        raise HTTPException(400, "فرمت پشتیبانی نمی‌شود (JPG، JPEG، PNG یا WebP)")
+    fname = f"{uuid.uuid4().hex}.{ext}"
+    (MEDIA_DIR / fname).write_bytes(data)
+    url = f"/media/{fname}"
+    insert_image(url, fname)
+    log_activity("image_upload", fname)
+    await manager.broadcast_update("upload_image")
+    return {"url": url}
+
+
+@app.get("/api/admin/images")
+def list_images(username: str = Depends(current_admin)):
+    return {"items": get_images()}
+
+
+@app.delete("/api/admin/images/{iid}")
+async def remove_image(iid: int, username: str = Depends(current_admin)):
+    image = get_image(iid)
+    if not image:
+        raise HTTPException(404, "تصویر یافت نشد")
+    filename = Path(image["filename"])
+    media_root = MEDIA_DIR.resolve()
+    file_path = (media_root / filename).resolve()
+    if filename.is_absolute() or filename.name != image["filename"] or file_path.parent != media_root:
+        raise HTTPException(400, "مسیر تصویر نامعتبر است")
+    file_path.unlink(missing_ok=True)
+    delete_image_row(iid)
+    log_activity("image_delete", image["filename"])
+    await manager.broadcast_update("delete_image")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- admin: display connections
+# همه تلویزیون‌ها لینک مشترک /display را باز می‌کنند؛ دیگر ثبت‌نام/توکن برای هر نمایشگر وجود ندارد.
+@app.get("/api/admin/displays")
+def admin_displays(username: str = Depends(current_admin)):
+    return {"url": "/display", "connected": len(manager.displays)}
+
+
+def broadcast_displays_state() -> None:
+    asyncio.get_event_loop().create_task(manager.push_displays_state())
+
+
+# ---------------------------------------------------------------- admin: settings + stats + backup
+@app.get("/api/admin/activity")
+def admin_activity(username: str = Depends(current_admin)):
+    return {"items": get_activity(30)}
+
+
+@app.get("/api/admin/settings")
+def admin_settings(username: str = Depends(current_admin)):
+    return get_settings()
+
+
+@app.put("/api/admin/settings")
+async def put_settings(body: SettingsIn, username: str = Depends(current_admin)):
+    if body.show_mode not in (None, "slide", "grid"):
+        raise HTTPException(400, "حالت نمایش نامعتبر است")
+    if body.sync_mode not in (None, "independent", "synchronized"):
+        raise HTTPException(400, "حالت همگام‌سازی نامعتبر است")
+    for c in (body.background_color, body.accent_color):
+        if c and not re.match(r"^#[0-9a-fA-F]{6}$", c):
+            raise HTTPException(400, "رنگ باید به فرمت HEX باشد")
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    old = get_settings()
+    save_settings(data)
+    log_activity("settings", ", ".join(data.keys()))
+    if body.duration_seconds is not None or body.show_mode is not None:
+        reset_slide_cycle()  # keep all TVs step-locked while timing changes
+    await manager.broadcast_update("settings")
+    return get_settings()
+
+
+@app.get("/api/admin/stats")
+def admin_stats(username: str = Depends(current_admin)):
+    products = get_products()
+    ts = now()
+    discounted = sum(1 for p in products if discount_ok(p))
+    upcoming = sum(
+        1 for p in products
+        if p["sale_price"] and p["discount_start"] and not discount_ok(p) and ts < p["discount_start"]
+    )
+    expired = sum(
+        1 for p in products
+        if p["sale_price"] and p["discount_end"] and not discount_ok(p) and ts > p["discount_end"]
+    )
+    last_sync = max((p["updated_at"] for p in products), default=0)
+    return {
+        "total_products": len(products),
+        "active_products": sum(1 for p in products if p["active"]),
+        "inactive_products": sum(1 for p in products if not p["active"]),
+        "discounted_products": discounted,
+        "upcoming_discounts": upcoming,
+        "expired_discounts": expired,
+        "displays_connected": len(manager.displays),
+        "last_sync": last_sync,
+    }
+
+
+@app.get("/api/admin/backup")
+def backup(username: str = Depends(current_admin)):
+    return {
+        "exported_at": now(),
+        "products": get_products(),
+        "settings": get_settings(),
+    }
+
+
+# ---------------------------------------------------------------- public (TV)
+# لینک مشترک: همه تلویزیون‌ها صفحه /display را باز می‌کنند (بدون توکن اختصاصی).
+@app.get("/api/public/display")
+def public_display():
+    settings = get_settings()
+    products = [public_product(p) for p in get_products() if p["active"]]
+    st = normalize_slide_state()
+    dur = max(settings.get("duration_seconds", 10), 3)
+    server_now = int(time.time() * 1000)  # ms epoch for clock alignment
+    total = slide_count()
+    return {
+        "settings": settings,
+        "products": products,
+        "sync": {
+            "server_time": server_now,
+            "duration": dur,
+            "total": total,
+            "slide_index": st["index"] % max(total, 1),
+            "slide_end": st["next_flip"] * 1000,
+        },
+    }
+
+
+# ---------------------------------------------------------------- websocket
+@app.websocket("/ws/display")
+async def ws_display(ws: WebSocket):
+    """Shared TV connection — no per-TV token."""
+    await manager.connect_display(ws)
+    # تازه‌وارد/ریفرش‌شده فوراً همريقة اسلاید جاری را می‌گیرد
+    st = normalize_slide_state()
+    await ws.send_json({
+        "type": "slide",
+        "index": st["index"] % max(slide_count(), 1),
+        "server_time": int(time.time() * 1000),
+    })
+    try:
+        while True:
+            msg = await ws.receive_text()
+            if msg == "ping":
+                await ws.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect_display(ws)
+    except Exception:
+        manager.disconnect_display(ws)
+
+
+@app.websocket("/ws/admin")
+async def ws_admin(ws: WebSocket):
+    await ws.accept()
+    # first message must authenticate
+    try:
+        first = await ws.receive_json()
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        if ws.application_state == WebSocketState.CONNECTED:
+            await ws.close(code=4001)
+        return
+    username = security.decode_token(str(first.get("token", "")))
+    if not username or not get_user(username):
+        await ws.close(code=4001)
+        return
+    await manager.connect_admin(ws)
+    try:
+        broadcast_displays_state()
+        while True:
+            msg = await ws.receive_text()
+            if msg == "ping":
+                await ws.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect_admin(ws)
+    except Exception:
+        manager.disconnect_admin(ws)
+
+
+# ---------------------------------------------------------------- media
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "time": now()}

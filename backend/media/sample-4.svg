@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#1d3557"/><stop offset="100%" stop-color="#457b9d"/>
+  </linearGradient></defs>
+  <rect width="800" height="600" fill="url(#g)"/>
+  <circle cx="400" cy="300" r="180" fill="#ffffff22"/>
+  <text x="400" y="290" font-size="150" text-anchor="middle" fill="#fff">🎒</text>
+  <text x="400" y="400" font-size="44" text-anchor="middle" fill="#ffffffcc" font-family="sans-serif">کاور کوله‌پشتی ورزشی</text>
+  <text x="400" y="470" font-size="26" text-anchor="middle" fill="#ffffff88" font-family="sans-serif">تصویر آزمایشی</text>
+</svg>
